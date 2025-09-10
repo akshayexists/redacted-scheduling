@@ -1,0 +1,346 @@
+"""
+Constraint-Bound Scheduling Framework
+- Single-file scheduler using OR-Tools CP-SAT.
+"""
+
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+from ortools.sat.python import cp_model
+import pandas as pd
+import json
+import sys
+
+class Scheduler:
+    """
+    Scheduler organizes 'task instances' (concrete occurrences) into calendar periods.
+    Design:
+    - Each event type (e.g. "A") has a regular_count -> this expands into that many concrete tasks.
+    - Boolean vars t[i,p] indicate whether task instance i is assigned to period p.
+    - occ[e,p] indicates whether event type e occupies period p (derived from t).
+    - Penalties:
+        * consec_penalty for same event occupying consecutive periods
+        * extra_penalty for repeats too close (within spacing threshold)
+        * soft-deadline penalties per-task when scheduled after deadline (scaled by weight)
+    - Hard deadlines are enforced by forbidding assignments after the deadline.
+    - Tie-breaker: small weighted term preferring earlier or later occupied periods.
+    """
+
+    def __init__(self, config_file="data.json"):
+        # Load config (will sys.exit on failure)
+        self.cfg = self._load_config(config_file)
+
+        # Core calendar parameters
+        self.total_periods = int(self.cfg.get("total_periods", self.cfg.get("total_weeks", 52)))
+        self.base_date = datetime.strptime(self.cfg.get("base_date", "2025-03-31"), "%Y-%m-%d")
+        self.period_type = self.cfg.get("period_type", "weeks")
+        self.period_length = int(self.cfg.get("period_length", 1))
+
+        # Output & labels
+        self.task_label = self.cfg.get("task_label", "event")
+        self.output_file = self.cfg.get("output_filename", "schedule.xlsx")
+        self.sheet_name = self.cfg.get("sheet_name", "Packed")
+
+        # Penalty parameters (with defaults)
+        pp = self.cfg.get("penalty_parameters", {})
+        self.consec_pen = int(pp.get("consec_penalty", 500))
+        self.extra_pen = int(pp.get("extra_penalty", 300))
+        self.spacing = int(pp.get("spacing_threshold", 4))
+        # base penalty unit used for soft-deadline lateness; scaled by event weight
+        self.late_base_pen = int(pp.get("late_base_penalty", 100))
+
+        # Solver / tie-break config
+        self.prefer = str(self.cfg.get("prefer", "early")).lower()   # "early" or "late"
+        self.tie_weight = int(self.cfg.get("tie_weight", 1))         # small integer weight
+        self.solver_time = float(self.cfg.get("solver_time_seconds", 30))
+        self.random_seed = int(self.cfg.get("random_seed", 42))
+
+        # Event types (list of dicts)
+        self.event_types = self.cfg.get("event_types", [])
+        # Normalize event fields and expand tasks
+        self._prepare()
+
+    def _load_config(self, filename):
+        """Read JSON config. Exit on error with useful message."""
+        try:
+            with open(filename, "r") as fh:
+                return json.load(fh)
+        except Exception as e:
+            print("Failed to read config file:", e)
+            sys.exit(1)
+
+    def _prepare(self):
+        """Normalize event type fields, expand task instances, and build fixed periods map."""
+        # Ensure canonical keys and defaults for event types
+        for et in self.event_types:
+            et.setdefault("regular_count", 0)
+            et.setdefault("final_week", self.total_periods + 1)
+            et.setdefault("deadline", et["final_week"] - 1)
+            et.setdefault("deadline_type", "soft")   # default soft unless specified hard
+            et.setdefault("weight", 1)
+
+        # Build fixed periods: Reserved / Public Holiday / Unavailable
+        self.fixed = {}
+        reserved = set(self.cfg.get("reserved", []))
+        holidays = set(self.cfg.get("public_holidays", []))
+        unavailable = set(self.cfg.get("unavailable", []))
+        for p in range(1, self.total_periods + 1):
+            labels = []
+            if p in reserved: labels.append("Reserved")
+            if p in holidays: labels.append("Public Holiday")
+            if p in unavailable: labels.append("Unavailable")
+            self.fixed[p] = ", ".join(labels) if labels else None
+
+        # Mark final events as fixed (one final per event if final_week within horizon)
+        finals = set()
+        for et in self.event_types:
+            fw = int(et["final_week"])
+            if 1 <= fw <= self.total_periods:
+                if fw in finals:
+                    print(f"Config error: multiple final events scheduled at period {fw}")
+                    sys.exit(1)
+                finals.add(fw)
+                self.fixed[fw] = f"{et['name']} Final {self.task_label}"
+
+        # Expand tasks: list of tuples (event_index, instance_index)
+        self.tasks = []
+        for ei, et in enumerate(self.event_types):
+            rc = int(et.get("regular_count", 0))
+            for inst in range(rc):
+                self.tasks.append((ei, inst))
+
+        # Free periods (where tasks can be scheduled)
+        self.free_periods = [p for p in range(1, self.total_periods + 1) if self.fixed.get(p) is None]
+
+        # Quick feasibility check
+        if len(self.tasks) > len(self.free_periods):
+            print(f"Not enough free periods: tasks={len(self.tasks)} free_periods={len(self.free_periods)}")
+            sys.exit(1)
+
+    # ---------------------
+    # Date helpers
+    # ---------------------
+    def add_period(self, base, period):
+        """Return datetime offset by (period-1) units of configured type/length."""
+        m = period - 1
+        pt = self.period_type.lower()
+        if pt == "minutes": return base + timedelta(minutes=m * self.period_length)
+        if pt == "hours": return base + timedelta(hours=m * self.period_length)
+        if pt == "days": return base + timedelta(days=m * self.period_length)
+        if pt == "weeks": return base + timedelta(weeks=m * self.period_length)
+        if pt == "months": return base + relativedelta(months=m * self.period_length)
+        if pt == "years": return base + relativedelta(years=m * self.period_length)
+        return base + timedelta(weeks=m * self.period_length)
+
+    def format_range(self, period):
+        """Human-readable date range for a period (used in export)."""
+        start = self.add_period(self.base_date, period)
+        pt = self.period_type.lower()
+        if pt in ("days", "weeks"):
+            length = timedelta(days=self.period_length) if pt == "days" else timedelta(weeks=self.period_length)
+            end = start + length - timedelta(seconds=1)
+            return f"{start.strftime('%d/%m/%y')} -- {end.strftime('%d/%m/%y')}"
+        if pt == "months":
+            end = self.add_period(self.base_date, period + 1) - timedelta(seconds=1)
+            return f"{start.strftime('%B %Y')} -- {end.strftime('%B %Y')}"
+        if pt == "years":
+            end = self.add_period(self.base_date, period + 1) - timedelta(seconds=1)
+            return f"{start.strftime('%Y')} -- {end.strftime('%Y')}"
+        return f"{start} -- {start}"
+
+    # ---------------------
+    # Core solve method
+    # ---------------------
+    def solve(self):
+        """Build and solve CP-SAT model. Returns (schedule_map, deadline_status_map)."""
+        model = cp_model.CpModel()
+
+        T = len(self.tasks)                 # number of concrete task instances
+        P = list(range(1, self.total_periods + 1))
+        E = len(self.event_types)
+
+        # 1) Create t[i,p] boolean variables: task i assigned to period p
+        t = {}
+        for i in range(T):
+            for p in P:
+                # create exactly one BoolVar per (i,p)
+                t[(i, p)] = model.NewBoolVar(f"t_{i}_{p}")
+
+        # 2) For each task instance, constrain allowed periods:
+        #    - cannot assign to fixed periods
+        #    - cannot assign to periods >= final_week
+        #    - if deadline_type == hard, disallow p > deadline
+        for i, (ei, inst) in enumerate(self.tasks):
+            et = self.event_types[ei]
+            allowed = []
+            for p in P:
+                if self.fixed.get(p) is not None:
+                    continue
+                if p >= int(et["final_week"]):
+                    continue
+                if str(et.get("deadline_type", "soft")).lower() == "hard" and p > int(et.get("deadline", et["final_week"] - 1)):
+                    continue
+                allowed.append(p)
+            if not allowed:
+                print(f"No allowed periods for task instance {i} (event {et['name']}). Check final_week / deadline / deadline_type.")
+                sys.exit(1)
+            # exactly one of the allowed periods must be chosen
+            model.Add(sum(t[(i, p)] for p in allowed) == 1)
+            # explicitly forbid disallowed periods (helps solver)
+            disallowed = [p for p in P if p not in allowed]
+            for p in disallowed:
+                model.Add(t[(i, p)] == 0)
+
+        # 3) At most one task per period (free periods only). Fixed periods must have zero tasks.
+        for p in P:
+            if self.fixed.get(p) is not None:
+                model.Add(sum(t[(i, p)] for i in range(T)) == 0)
+            else:
+                model.Add(sum(t[(i, p)] for i in range(T)) <= 1)
+
+        # 4) Occurrence variable occ[e,p] -> whether event type e occupies period p.
+        #    We force occ == sum(tasks_of_event_at_p) (sum is 0 or 1 because of step 3).
+        occ = {}
+        for e in range(E):
+            for p in P:
+                occ[(e, p)] = model.NewBoolVar(f"occ_{e}_{p}")
+                # sum of tasks for this event at p
+                sum_tasks = sum(t[(i, p)] for i, (ei, _) in enumerate(self.tasks) if ei == e)
+                # Enforce equality: occ == sum_tasks
+                # sum_tasks is a linear expression; equality with BoolVar is allowed.
+                model.Add(occ[(e, p)] == sum_tasks)
+
+        # 5) Penalty boolean variables: consecutive occupancy (y) and short-spacing repeats (z)
+        consec_y = []   # tuples (y_var, event_index, period)
+        for e in range(E):
+            for p in range(1, self.total_periods):
+                y = model.NewBoolVar(f"y_{e}_{p}")
+                # Linearization: y == 1 iff occ[e,p] == 1 and occ[e,p+1] == 1
+                # Implement as: y <= occ(e,p), y <= occ(e,p+1), y >= occ(e,p) + occ(e,p+1) - 1
+                model.Add(y <= occ[(e, p)])
+                model.Add(y <= occ[(e, p + 1)])
+                model.Add(y >= occ[(e, p)] + occ[(e, p + 1)] - 1)
+                consec_y.append((y, e, p))
+
+        extra_z = []  # tuples (z_var, event_index, p, q)
+        for e in range(E):
+            for p in range(1, self.total_periods + 1):
+                # q starts at p+2 (so spacing of at least 2 between repeats) and runs while q < p+spacing
+                for q in range(p + 2, min(self.total_periods + 1, p + self.spacing)):
+                    z = model.NewBoolVar(f"z_{e}_{p}_{q}")
+                    model.Add(z <= occ[(e, p)])
+                    model.Add(z <= occ[(e, q)])
+                    model.Add(z >= occ[(e, p)] + occ[(e, q)] - 1)
+                    extra_z.append((z, e, p, q))
+
+        # 6) Soft-deadline penalties: for each task i and period p where p > deadline and deadline_type == soft,
+        #    we add a weighted penalty coefficient times t[(i,p)] (so the solver prefers not to place the task after deadline).
+        late_terms = []  # list of (bool_var, penalty_coefficient)
+        for i, (ei, inst) in enumerate(self.tasks):
+            et = self.event_types[ei]
+            if str(et.get("deadline_type", "soft")).lower() == "soft":
+                dl = int(et.get("deadline", et.get('final_week', self.total_periods + 1) - 1))
+                weight = int(et.get("weight", 1))
+                for p in P:
+                    # only consider candidate periods that are allowed (not fixed, before final_week)
+                    if p > dl and self.fixed.get(p) is None and p < int(et.get("final_week", self.total_periods + 1)):
+                        late_terms.append((t[(i, p)], weight * self.late_base_pen))
+
+        # 7) Build objective: sum of weighted penalties (consecutive, extra spacing, late), plus tie-break terms.
+        obj_terms = []
+        # consecutive penalties (scale by event weight)
+        for (y, e, p) in consec_y:
+            w = max(1, int(self.event_types[e].get("weight", 1)))
+            obj_terms.append(self.consec_pen * w * y)
+        # extra spacing penalties
+        for (z, e, p, q) in extra_z:
+            w = max(1, int(self.event_types[e].get("weight", 1)))
+            obj_terms.append(self.extra_pen * w * z)
+        # late penalties
+        for (var, pen) in late_terms:
+            obj_terms.append(pen * var)
+
+        # Tie-breaker: prefer earlier or later occupied periods.
+        # We create occ_total_p which equals 1 iff any event occupies p. Since occ[(e,p)] are 0/1 and sum at most 1,
+        # we can define occ_total_p as equality to the sum over events.
+        maxp = self.total_periods
+        for p in P:
+            occ_total = model.NewBoolVar(f"occ_total_{p}")
+            model.Add(occ_total == sum(occ[(e, p)] for e in range(E)))
+            if self.prefer == "late":
+                tie_coeff = (maxp + 1 - p) * self.tie_weight
+            else:
+                tie_coeff = p * self.tie_weight
+            obj_terms.append(tie_coeff * occ_total)
+
+        # Finalize objective
+        if obj_terms:
+            model.Minimize(sum(obj_terms))
+        else:
+            model.Minimize(0)
+
+        # 8) Solve with parameters
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = max(1.0, float(self.solver_time))
+        solver.parameters.num_search_workers = int(self.cfg.get("num_search_workers", 8))
+        solver.parameters.random_seed = int(self.random_seed)
+
+        status = solver.Solve(model)
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            print("Solver returned no feasible solution")
+            sys.exit(1)
+
+        # 9) Build schedule and deadline status map for export
+        schedule = {p: self.fixed.get(p) for p in P}
+        deadline_status = {p: (self.fixed.get(p) if self.fixed.get(p) else "") for p in P}
+
+        # Determine which event occupies each period via occ[(e,p)]
+        for p in P:
+            if self.fixed.get(p) is not None:
+                # already annotated; final/reserved/holiday/unavailable etc.
+                continue
+            occupant = None
+            for e in range(E):
+                if solver.Value(occ[(e, p)]) == 1:
+                    occupant = e
+                    break
+            if occupant is None:
+                # empty period
+                continue
+            et = self.event_types[occupant]
+            schedule[p] = f"{et['name']} {self.task_label}"
+            # determine deadline status: "Late (soft)" if deadline_type soft and p > deadline
+            if str(et.get("deadline_type", "soft")).lower() == "soft" and p > int(et.get("deadline", et.get("final_week") - 1)):
+                deadline_status[p] = "Late (soft)"
+            else:
+                deadline_status[p] = "On time"
+
+        return schedule, deadline_status
+
+    # ---------------------
+    # Export
+    # ---------------------
+    def export_excel(self, schedule, deadline_status):
+        """Write Excel with Period, Date Range, Task, Deadline Status columns."""
+        rows = []
+        for p in range(1, self.total_periods + 1):
+            rows.append({
+                "Period": p,
+                "Date Range": self.format_range(p),
+                "Task": schedule.get(p),
+                "Deadline Status": deadline_status.get(p, "")
+            })
+        df = pd.DataFrame(rows)
+        try:
+            df.to_excel(self.output_file, sheet_name=self.sheet_name, index=False)
+            print(f"Wrote schedule to '{self.output_file}'")
+        except Exception as e:
+            print("Failed to write Excel:", e)
+            sys.exit(1)
+
+    # Entry point
+    def run(self):
+        schedule, status = self.solve()
+        self.export_excel(schedule, status)
+
+if __name__ == "__main__":
+    Scheduler().run()
