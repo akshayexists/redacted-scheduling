@@ -1,0 +1,32 @@
+{
+  "total_periods": 52,
+  "base_date": "2025-01-01",
+  "period_type": "weeks",
+  "period_length": 1,
+  "output_filename": "schedule.xlsx",
+  "sheet_name": "Packed",
+  "task_label": "abc",
+  "penalty_parameters": {
+    "consec_penalty": 500,
+    "extra_penalty": 300,
+    "spacing_threshold": 4,
+    "late_base_penalty": 100
+  },
+  "prefer": "early",
+  "tie_weight": 1,
+  "solver_time_seconds": 30,
+  "num_search_workers": 8,
+  "random_seed": 42,
+  "event_types": [
+    {"name": "A", "regular_count": 5, "final_week": 11, "deadline": 10, "deadline_type": "hard", "weight": 2},
+    {"name": "B", "regular_count": 6, "final_week": 19, "deadline": 18, "deadline_type": "soft", "weight": 1},
+    {"name": "C", "regular_count": 1, "final_week": 24, "deadline": 23, "deadline_type": "soft", "weight": 1},
+    {"name": "D", "regular_count": 9, "final_week": 42, "deadline": 41, "deadline_type": "hard", "weight": 3},
+    {"name": "E", "regular_count": 5, "final_week": 46, "deadline": 45, "deadline_type": "soft", "weight": 1},
+    {"name": "F", "regular_count": 3, "final_week": 52, "deadline": 50, "deadline_type": "hard", "weight": 2},
+    {"name": "G", "regular_count": 4, "deadline_type": "soft", "weight": 1}
+  ],
+  "public_holidays": [39, 47],
+  "reserved": [15, 28],
+  "unavailable": [34, 36, 37, 38, 39, 40]
+}
