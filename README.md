@@ -46,4 +46,4 @@ Built using Google OR‑Tools [CP-SAT](https://developers.google.com/optimizatio
 ```cmd
 python scheduling.py
 ```
-edit data.json to your needs
+edit data.json for your specific context
